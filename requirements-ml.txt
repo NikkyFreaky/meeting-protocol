@@ -1,0 +1,4 @@
+faster-whisper==1.2.1
+sherpa-onnx==2.0.1
+# Faster Whisper 1.2.1 uses av.open(metadata_errors=...), removed in PyAV 19.
+av==16.1.0
