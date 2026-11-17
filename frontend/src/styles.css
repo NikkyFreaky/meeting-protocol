@@ -102,9 +102,18 @@ small { color: var(--muted); }
 .history-empty strong { color: var(--ink); }
 .history-empty .button { margin-left: auto; }
 .history-list { display: grid; overflow: hidden; }
-.history-item { width: 100%; display: flex; align-items: center; gap: 11px; padding: 11px 15px; text-align: left; border: 0; border-bottom: 1px solid var(--line); background: #fff; }
-.history-item:last-child { border-bottom: 0; }
-.history-item:hover { background: #faf8fd; }
+.history-row { display: flex; align-items: center; padding-right: 8px; border-bottom: 1px solid var(--line); background: #fff; }
+.history-row:last-child { border-bottom: 0; }
+.history-row:hover { background: #faf8fd; }
+.history-item { flex: 1; min-width: 0; display: flex; align-items: center; gap: 11px; padding: 11px 8px 11px 15px; text-align: left; border: 0; background: transparent; }
+.history-delete { flex-shrink: 0; }
+.history-delete:hover:not(:disabled) { color: #a13349; background: #faebec; }
+.delete-dialog { width: min(420px, calc(100% - 32px)); padding: 24px; margin: auto; color: var(--ink); background: #fff; border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 16px 64px #20183c33; }
+.delete-dialog::backdrop { background: #24203170; }
+.delete-dialog p { margin: 10px 0 18px; overflow-wrap: anywhere; }
+.delete-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.button-danger { color: #fff; background: #a72945; }
+.button-danger:hover:not(:disabled) { background: #8f223b; }
 .history-item:focus-visible { outline-offset: -3px; }
 .history-item-name { min-width: 0; flex: 1; }
 .history-item-name strong { overflow-wrap: anywhere; }
