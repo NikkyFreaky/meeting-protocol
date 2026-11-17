@@ -98,6 +98,10 @@ class TaskSelection(BaseModel):
     task_ids: list[TaskID] = Field(min_length=1, max_length=200)
 
 
+class ReprocessingOptions(BaseModel):
+    speaker_count: Annotated[int, Field(strict=True, ge=1, le=20)] | None = None
+
+
 class UploadTooLarge(MultiPartException):
     pass
 
@@ -210,7 +214,7 @@ def public_meeting(meeting, processing_rate=None):
         elapsed = max(0, time() - meeting["processing_started_at"])
         if expected > elapsed:
             eta_seconds = ceil(expected - elapsed)
-    private_fields = {"media_file", "media_type", "speaker_count", "processing_started_at", "processing_seconds"}
+    private_fields = {"media_file", "media_type", "processing_started_at", "processing_seconds"}
     return {
         **{key: value for key, value in meeting.items() if key not in private_fields},
         "media_url": media_url,
@@ -298,6 +302,7 @@ def config(request: Request):
         "integration_enabled": integration_enabled(),
         "demo_enabled": True,
         "deletion_enabled": True,
+        "reprocessing_enabled": True,
     }
 
 
@@ -331,6 +336,31 @@ async def upload_meeting(request: Request):
         await form.close()
     state.work_ready.set()
     return {**public_meeting(meeting), "processing_events": []}
+
+
+@app.post("/api/meetings/{meeting_id}/reprocess", status_code=202)
+async def reprocess_meeting(meeting_id: str, options: ReprocessingOptions, request: Request):
+    state = request.app.state
+    meeting = await run_in_threadpool(get_meeting, state.storage, meeting_id)
+    if meeting["demo"] or meeting["status"] not in {"completed", "failed"} or not meeting["media_file"]:
+        raise HTTPException(409, "Повторить обработку можно для завершённой или неудачной загрузки.")
+
+    def enqueue_copy():
+        source = state.storage.media_directory / meeting["media_file"]
+        try:
+            media = source.open("rb")
+        except FileNotFoundError as error:
+            raise HTTPException(404, "Исходный файл записи недоступен.") from error
+        with media:
+            suffix = " (повтор)"
+            return store_upload(
+                state.storage, UploadFile(media, filename=meeting["filename"]),
+                meeting["title"][:200 - len(suffix)] + suffix, options.speaker_count,
+            )
+
+    queued = await run_in_threadpool(enqueue_copy)
+    state.work_ready.set()
+    return {**public_meeting(queued), "processing_events": []}
 
 
 @app.post("/api/demo", status_code=201)

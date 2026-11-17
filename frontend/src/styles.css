@@ -112,6 +112,10 @@ small { color: var(--muted); }
 .delete-dialog::backdrop { background: #24203170; }
 .delete-dialog p { margin: 10px 0 18px; overflow-wrap: anywhere; }
 .delete-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.retry-form { display: grid; gap: 16px; }
+.retry-form .error-message { margin: 0; }
+.record-navigation { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 17px; }
+.record-navigation .back-link { margin-bottom: 0; }
 .button-danger { color: #fff; background: #a72945; }
 .button-danger:hover:not(:disabled) { background: #8f223b; }
 .history-item:focus-visible { outline-offset: -3px; }
