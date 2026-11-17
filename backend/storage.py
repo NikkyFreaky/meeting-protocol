@@ -5,6 +5,8 @@ import sqlite3
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from statistics import median
+from time import time
 
 
 def utc_now() -> str:
@@ -57,8 +59,14 @@ class Storage:
                     PRIMARY KEY (meeting_id, task_id)
                 );
             """)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(meetings)")}
+            if "processing_started_at" not in columns:
+                connection.execute("ALTER TABLE meetings ADD COLUMN processing_started_at REAL")
+            if "processing_seconds" not in columns:
+                connection.execute("ALTER TABLE meetings ADD COLUMN processing_seconds REAL")
             connection.execute("""
-                UPDATE meetings SET status = 'queued', stage = 'queued'
+                UPDATE meetings SET status = 'queued', stage = 'queued',
+                    processing_started_at = NULL, duration = NULL
                 WHERE status = 'processing'
             """)
             # An interrupted HTTP request may already have created a remote task.
@@ -80,6 +88,13 @@ class Storage:
 
     def add(self, *, meeting_id, title, filename, media_file, media_type, speaker_count=None, result=None):
         with self.connection() as connection:
+            if result is not None:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = connection.execute("""
+                    SELECT * FROM meetings WHERE demo = 1 ORDER BY created_at DESC, rowid DESC LIMIT 1
+                """).fetchone()
+                if existing is not None:
+                    return self.decode(existing)
             connection.execute("""
                 INSERT INTO meetings (
                     id, title, filename, media_file, media_type, speaker_count,
@@ -99,8 +114,13 @@ class Storage:
     def list(self):
         with self.connection() as connection:
             rows = connection.execute("""
-                SELECT id, title, filename, media_file, created_at, status, stage, error, duration, demo
-                FROM meetings ORDER BY created_at DESC, rowid DESC
+                SELECT id, title, filename, media_file, created_at, status, stage, error, duration, demo,
+                    processing_started_at
+                FROM meetings
+                WHERE demo = 0 OR id = (
+                    SELECT id FROM meetings WHERE demo = 1 ORDER BY created_at DESC, rowid DESC LIMIT 1
+                )
+                ORDER BY created_at DESC, rowid DESC
             """).fetchall()
         return [self.decode(row) for row in rows]
 
@@ -111,26 +131,41 @@ class Storage:
     def claim(self):
         with self.connection() as connection:
             row = connection.execute("""
-                UPDATE meetings SET status = 'processing', stage = 'decode', error = NULL
+                UPDATE meetings SET status = 'processing', stage = 'decode', error = NULL,
+                    processing_started_at = ?
                 WHERE id = (SELECT id FROM meetings WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1)
                 RETURNING *
-            """).fetchone()
+            """, (time(),)).fetchone()
             return self.decode(row)
 
     def progress(self, meeting_id, stage):
         with self.connection() as connection:
             connection.execute("UPDATE meetings SET stage = ? WHERE id = ? AND status = 'processing'", (stage, meeting_id))
 
+    def set_duration(self, meeting_id, duration):
+        with self.connection() as connection:
+            connection.execute("UPDATE meetings SET duration = ? WHERE id = ? AND status = 'processing'", (duration, meeting_id))
+
+    def processing_rate(self):
+        with self.connection() as connection:
+            samples = connection.execute("""
+                SELECT processing_seconds / duration FROM meetings
+                WHERE status = 'completed' AND demo = 0 AND duration >= 30 AND processing_seconds > 0
+                ORDER BY processing_started_at DESC LIMIT 10
+            """).fetchall()
+        return median(row[0] for row in samples) if samples else None
+
     def complete(self, meeting_id, result):
         with self.connection() as connection:
             connection.execute("""
                 UPDATE meetings SET status = 'completed', stage = 'ready',
-                    duration = ?, speakers = ?, segments = ?, protocol = ?
+                    duration = ?, speakers = ?, segments = ?, protocol = ?,
+                    processing_seconds = MAX(0.001, ? - processing_started_at)
                 WHERE id = ? AND status = 'processing'
             """, (
                 result["duration"], json.dumps(result["speakers"], ensure_ascii=False),
                 json.dumps(result["segments"], ensure_ascii=False),
-                json.dumps(result["protocol"], ensure_ascii=False), meeting_id,
+                json.dumps(result["protocol"], ensure_ascii=False), time(), meeting_id,
             ))
 
     def fail(self, meeting_id, error):

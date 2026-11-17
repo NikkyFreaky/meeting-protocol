@@ -6,9 +6,11 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import asynccontextmanager
+from math import ceil
 from multiprocessing import get_context
 from pathlib import Path
 from shutil import copyfileobj
+from time import time
 from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import uuid4
@@ -110,6 +112,7 @@ def process(storage, meeting, cpu_threads):
             meeting["speaker_count"],
             lambda stage: storage.progress(meeting_id, stage),
             cpu_threads=cpu_threads,
+            on_duration=lambda duration: storage.set_duration(meeting_id, duration),
         )
         storage.complete(meeting_id, result)
     except PipelineError as error:
@@ -179,13 +182,22 @@ async def lifespan(app):
 app = FastAPI(title="Протокол совещаний", version="0.1.0", lifespan=lifespan)
 
 
-def public_meeting(meeting):
+def public_meeting(meeting, processing_rate=None):
     media_url = None
     if meeting["media_file"] or (meeting["demo"] and DEMO_MEDIA.is_file()):
         media_url = f"/api/meetings/{meeting['id']}/media"
+    eta_seconds = None
+    if meeting["status"] == "processing" and meeting["duration"] and meeting["processing_started_at"]:
+        duration = meeting["duration"]
+        expected = duration * processing_rate if processing_rate else 15 + duration * 0.75
+        elapsed = max(0, time() - meeting["processing_started_at"])
+        if expected > elapsed:
+            eta_seconds = ceil(expected - elapsed)
+    private_fields = {"media_file", "media_type", "speaker_count", "processing_started_at", "processing_seconds"}
     return {
-        **{key: value for key, value in meeting.items() if key not in {"media_file", "media_type", "speaker_count"}},
+        **{key: value for key, value in meeting.items() if key not in private_fields},
         "media_url": media_url,
+        "eta_seconds": eta_seconds,
     }
 
 
@@ -273,7 +285,10 @@ def config(request: Request):
 
 @app.get("/api/meetings")
 def list_meetings(request: Request):
-    return [public_meeting(meeting) for meeting in request.app.state.storage.list()]
+    storage = request.app.state.storage
+    meetings = storage.list()
+    rate = storage.processing_rate() if any(meeting["status"] == "processing" for meeting in meetings) else None
+    return [public_meeting(meeting, rate) for meeting in meetings]
 
 
 @app.post("/api/meetings", status_code=202)
@@ -315,8 +330,9 @@ def create_demo(request: Request):
 @app.get("/api/meetings/{meeting_id}")
 def detail(meeting_id: str, request: Request):
     storage = request.app.state.storage
-    meeting = public_meeting(get_meeting(storage, meeting_id))
-    return {**meeting, "deliveries": storage.deliveries(meeting_id)}
+    meeting = get_meeting(storage, meeting_id)
+    rate = storage.processing_rate() if meeting["status"] == "processing" else None
+    return {**public_meeting(meeting, rate), "deliveries": storage.deliveries(meeting_id)}
 
 
 @app.patch("/api/meetings/{meeting_id}")

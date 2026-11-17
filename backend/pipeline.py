@@ -198,11 +198,14 @@ def _whisper_words(samples, duration: float, cpu_threads: int) -> Iterable[Word]
 
 
 def process_media(
-    path: Path, speaker_count: int | None, on_stage: Callable[[str], None], *, cpu_threads: int = 0,
+    path: Path, speaker_count: int | None, on_stage: Callable[[str], None], *,
+    cpu_threads: int = 0, on_duration: Callable[[float], None] | None = None,
 ) -> MeetingResult:
     on_stage("decode")
     samples = _decode(path)
     duration = len(samples) / SAMPLE_RATE
+    if on_duration is not None:
+        on_duration(round(duration, 3))
 
     on_stage("diarize")
     turns, speakers = _diarize(samples, speaker_count, duration)
