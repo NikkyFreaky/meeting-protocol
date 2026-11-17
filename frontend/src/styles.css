@@ -156,12 +156,22 @@ input[type=checkbox] { width: 16px; height: 16px; margin: 3px 0 0; accent-color:
 .processing-card h2 { margin-top: 13px; font-size: 20px; letter-spacing: -.04em; }
 .processing-card p { margin: 6px 0 15px; color: var(--muted); overflow-wrap: anywhere; white-space: pre-wrap; }
 .failure { color: #96394d; background: #f8e7eb; }
-.stage-list { list-style: none; display: grid; gap: 8px; padding: 0; }
-.stage-list li { display: flex; align-items: center; gap: 10px; color: var(--muted); }
-.stage-list li span { width: 9px; height: 9px; border: 1px solid #c8c2d2; border-radius: 50%; }
-.stage-list .stage-current { color: var(--accent); font-weight: 650; }
-.stage-current span { background: var(--accent-fill); border-color: var(--accent-fill) !important; outline: 3px solid #efebfa; }
-.stage-done span { background: #58a683; border-color: #58a683 !important; }
+.processing-journal { margin-top: 16px; padding: 16px 18px; }
+.processing-journal h2 { font-size: 16px; margin-bottom: 8px; }
+.journal-stages, .journal-entries { list-style: none; padding: 0; margin: 0; }
+.journal-stages > li + li { border-top: 1px solid var(--line); }
+.journal-stages summary { display: flex; align-items: center; gap: 8px; padding: 10px 2px; cursor: pointer; font-size: 13px; font-weight: 600; }
+.journal-stages summary::-webkit-details-marker { display: none; }
+.journal-chevron { flex-shrink: 0; color: var(--muted); }
+.journal-stages details[open] .journal-chevron { transform: rotate(90deg); }
+.journal-state { margin-left: auto; font-size: 11px; color: var(--muted); }
+.journal-state.running { color: var(--accent); }
+.journal-state.done { color: #286344; }
+.journal-state.error, .journal-error { color: #913547; }
+.journal-entries { max-height: 240px; overflow: auto; display: grid; gap: 6px; padding: 1px 0 12px 26px; }
+.journal-entries li { display: flex; gap: 9px; align-items: baseline; font-size: 12px; overflow-wrap: anywhere; }
+.journal-entries time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.journal-empty { padding: 0 0 12px 26px; font-size: 12px; }
 .spin { animation: spin .85s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

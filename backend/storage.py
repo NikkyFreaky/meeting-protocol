@@ -62,6 +62,15 @@ class Storage:
                     url TEXT,
                     PRIMARY KEY (meeting_id, task_id)
                 );
+                CREATE TABLE IF NOT EXISTS processing_events (
+                    id INTEGER PRIMARY KEY,
+                    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                    stage TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS processing_events_meeting ON processing_events (meeting_id, id);
             """)
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(meetings)")}
             if "processing_started_at" not in columns:
@@ -185,11 +194,34 @@ class Storage:
                 WHERE id = (SELECT id FROM meetings WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1)
                 RETURNING *
             """, (time(),)).fetchone()
+            if row is not None:
+                connection.execute("DELETE FROM processing_events WHERE meeting_id = ?", (row["id"],))
             return self.decode(row)
+
+    @staticmethod
+    def _append_processing_event(connection, meeting_id, kind, message):
+        connection.execute("""
+            INSERT INTO processing_events (meeting_id, stage, kind, message, created_at)
+            SELECT id, stage, ?, ?, ? FROM meetings WHERE id = ? AND status = 'processing'
+        """, (kind, message, utc_now(), meeting_id))
+
+    def log_processing(self, meeting_id, kind, message):
+        with self.connection() as connection:
+            self._append_processing_event(connection, meeting_id, kind, message)
+
+    def processing_events(self, meeting_id):
+        with self.connection() as connection:
+            rows = connection.execute("""
+                SELECT id, stage, kind, message, created_at FROM processing_events
+                WHERE meeting_id = ? ORDER BY id
+            """, (meeting_id,)).fetchall()
+        return [dict(row) for row in rows]
 
     def progress(self, meeting_id, stage):
         with self.connection() as connection:
             result = connection.execute("UPDATE meetings SET stage = ? WHERE id = ? AND status = 'processing'", (stage, meeting_id))
+            if result.rowcount:
+                self._append_processing_event(connection, meeting_id, "start", "Этап начат.")
             return bool(result.rowcount)
 
     def set_duration(self, meeting_id, duration):
@@ -220,6 +252,7 @@ class Storage:
 
     def fail(self, meeting_id, error):
         with self.connection() as connection:
+            self._append_processing_event(connection, meeting_id, "error", error)
             connection.execute("""
                 UPDATE meetings SET status = 'failed', stage = 'failed', error = ?
                 WHERE id = ? AND status = 'processing'

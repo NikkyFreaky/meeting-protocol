@@ -122,6 +122,7 @@ def process(storage, meeting, cpu_threads):
             report_stage,
             cpu_threads=cpu_threads,
             on_duration=lambda duration: storage.set_duration(meeting_id, duration),
+            on_event=lambda kind, message: storage.log_processing(meeting_id, kind, message),
         )
         storage.complete(meeting_id, result)
     except MeetingDeleted:
@@ -329,7 +330,7 @@ async def upload_meeting(request: Request):
     finally:
         await form.close()
     state.work_ready.set()
-    return public_meeting(meeting)
+    return {**public_meeting(meeting), "processing_events": []}
 
 
 @app.post("/api/demo", status_code=201)
@@ -349,7 +350,11 @@ def detail(meeting_id: str, request: Request):
     storage = request.app.state.storage
     meeting = get_meeting(storage, meeting_id)
     rate = storage.processing_rate() if meeting["status"] == "processing" else None
-    return {**public_meeting(meeting, rate), "deliveries": storage.deliveries(meeting_id)}
+    return {
+        **public_meeting(meeting, rate),
+        "deliveries": storage.deliveries(meeting_id),
+        "processing_events": storage.processing_events(meeting_id),
+    }
 
 
 @app.delete("/api/meetings/{meeting_id}")
@@ -374,7 +379,11 @@ def edit_meeting(meeting_id: str, edit: MeetingEdit, request: Request):
     if edited is None:
         raise HTTPException(404, "Совещание не найдено.")
     updated = public_meeting(edited)
-    return {**updated, "deliveries": storage.deliveries(meeting_id)}
+    return {
+        **updated,
+        "deliveries": storage.deliveries(meeting_id),
+        "processing_events": storage.processing_events(meeting_id),
+    }
 
 
 @app.get("/api/meetings/{meeting_id}/media")
