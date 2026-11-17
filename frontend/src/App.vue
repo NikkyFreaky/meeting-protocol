@@ -7,6 +7,7 @@ import {
 import { request, uploadMeeting } from './api.js'
 import { clock, fileSize, meetingDate, remainingTime, stageNames, statusNames } from './format.js'
 import MeetingDetail from './MeetingDetail.vue'
+import ProcessingJournal from './ProcessingJournal.vue'
 
 const defaultExtensions = ['.mp3', '.wav', '.m4a', '.flac', '.aac', '.ogg', '.opus', '.mp4', '.webm', '.mov', '.mkv']
 const config = ref({ max_upload_mb: 250, extensions: defaultExtensions, demo_enabled: true })
@@ -37,8 +38,6 @@ let timer
 let dragDepth = 0
 
 const extensions = computed(() => config.value.extensions?.length ? config.value.extensions : defaultExtensions)
-const stages = Object.entries(stageNames)
-const stageIndex = computed(() => stages.findIndex(([id]) => id === meeting.value?.stage))
 const activeMeeting = computed(() => !!selectedId.value)
 const estimate = computed(() => remainingTime(meeting.value?.eta_seconds))
 
@@ -376,14 +375,10 @@ function updateMeeting(data) {
               <p v-else-if="estimate">Осталось {{ estimate }}</p>
               <p v-else-if="meeting.stage === 'decode'">Оценка появится после подготовки аудиодорожки.</p>
               <p v-else>Обработка продолжается. Уточняем время.</p>
-              <ol class="stage-list">
-                <li v-for="([id, name], index) in stages" :key="id"
-                  :class="{ 'stage-current': index === stageIndex, 'stage-done': index < stageIndex }">
-                  <span></span>{{ name }}
-                </li>
-              </ol>
             </section>
           </template>
+          <ProcessingJournal v-if="meeting && !meeting.demo && Array.isArray(meeting.processing_events)"
+            :key="`journal-${meeting.id}`" :meeting="meeting" />
         </template>
       </main>
     </div>

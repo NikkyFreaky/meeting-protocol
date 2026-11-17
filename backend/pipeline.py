@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from itertools import accumulate
 from pathlib import Path
+from time import monotonic
 from typing import TypedDict
 
 from .protocol import Protocol, TranscriptSegment, build_protocol
@@ -15,6 +16,7 @@ from .setup_models import download_diarization_models, model_cache_dir, whisper_
 
 SAMPLE_RATE = 16000
 UNKNOWN_SPEAKER = "unknown"
+ProgressLog = Callable[[str, str], None]
 
 
 class PipelineError(RuntimeError):
@@ -147,10 +149,23 @@ def _decode(path: Path):
     return samples
 
 
-def _diarize(samples, expected_speakers: int | None, duration: float) -> tuple[list[SpeakerTurn], dict[str, str]]:
+def _diarize(samples, expected_speakers: int | None, duration: float, log: ProgressLog) -> tuple[list[SpeakerTurn], dict[str, str]]:
+    last_report = float("-inf")
+
+    def report_chunks(processed, total):
+        nonlocal last_report
+        now = monotonic()
+        if total > 0 and (processed == total or now - last_report >= 10):
+            log("info", f"Диаризация: обработано фрагментов {processed} из {total}.")
+            last_report = now
+        return 0
+
     try:
+        log("info", "Подготавливаем модель Sherpa ONNX.")
         diarizer = _load_diarizer(model_cache_dir(), expected_speakers or -1)
-        intervals = diarizer.process(samples).sort_by_start_time()
+        mode = f"задано число участников: {expected_speakers}" if expected_speakers else "число участников определяется автоматически"
+        log("info", f"Анализируем голоса и паузы, {mode}.")
+        intervals = diarizer.process(samples, callback=report_chunks).sort_by_start_time()
     except PipelineError:
         raise
     except Exception as error:
@@ -173,11 +188,13 @@ def _diarize(samples, expected_speakers: int | None, duration: float) -> tuple[l
     return turns, speakers
 
 
-def _whisper_words(samples, duration: float, cpu_threads: int) -> Iterable[Word]:
+def _whisper_words(samples, duration: float, cpu_threads: int, log: ProgressLog) -> Iterable[Word]:
     language = os.getenv("WHISPER_LANGUAGE", "ru").strip().lower()
+    log("info", "Подготавливаем модель Whisper.")
     whisper = _load_whisper(whisper_model_name(), model_cache_dir(), cpu_threads)
     try:
-        segments, _ = whisper.transcribe(
+        log("info", "Ищем речь и включаем временные метки слов.")
+        segments, info = whisper.transcribe(
             samples,
             language=None if language in ("", "auto") else language,
             task="transcribe",
@@ -185,7 +202,14 @@ def _whisper_words(samples, duration: float, cpu_threads: int) -> Iterable[Word]
             vad_filter=True,
             condition_on_previous_text=False,
         )
+        log("info", f"Язык распознавания: {info.language}.")
+        last_report = float("-inf")
         for segment in segments:
+            now = monotonic()
+            if now - last_report >= 10:
+                position = min(duration, max(0, segment.end))
+                log("info", f"Whisper дошёл до отметки {position:.0f} с из {duration:.0f} с записи.")
+                last_report = now
             if segment.words:
                 for word in segment.words:
                     start = min(duration, max(0.0, word.start))
@@ -200,25 +224,37 @@ def _whisper_words(samples, duration: float, cpu_threads: int) -> Iterable[Word]
 def process_media(
     path: Path, speaker_count: int | None, on_stage: Callable[[str], None], *,
     cpu_threads: int = 0, on_duration: Callable[[float], None] | None = None,
+    on_event: ProgressLog | None = None,
 ) -> MeetingResult:
+    def log(kind, message):
+        if on_event is not None:
+            on_event(kind, message)
+
     on_stage("decode")
+    log("info", "Читаем звуковую дорожку и приводим её к моно 16 кГц.")
     samples = _decode(path)
     duration = len(samples) / SAMPLE_RATE
     if on_duration is not None:
         on_duration(round(duration, 3))
+    log("done", f"Аудиодорожка готова. Длительность: {duration:.1f} с.")
 
     on_stage("diarize")
-    turns, speakers = _diarize(samples, speaker_count, duration)
+    turns, speakers = _diarize(samples, speaker_count, duration, log)
+    log("done", f"Выделено голосов: {len(speakers)}. Интервалов речи: {len(turns)}.")
 
     on_stage("transcribe")
-    segments = align_words(_whisper_words(samples, duration, cpu_threads), turns)
+    segments = align_words(_whisper_words(samples, duration, cpu_threads, log), turns)
     if any(segment["speaker"] == UNKNOWN_SPEAKER for segment in segments):
         speakers[UNKNOWN_SPEAKER] = "Спикер не определён"
+    log("done", f"Сверили временные метки слов и говорящих. Реплик в стенограмме: {len(segments)}.")
 
     on_stage("protocol")
+    log("info", "Ищем в стенограмме темы, решения и поручения.")
+    protocol = build_protocol(segments, speakers)
+    log("done", f"Черновик готов. Тем: {len(protocol['topics'])}, решений: {len(protocol['decisions'])}, поручений: {len(protocol['tasks'])}.")
     return {
         "duration": round(duration, 3),
         "speakers": speakers,
         "segments": segments,
-        "protocol": build_protocol(segments, speakers),
+        "protocol": protocol,
     }
