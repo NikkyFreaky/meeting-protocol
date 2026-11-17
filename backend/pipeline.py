@@ -3,12 +3,9 @@
 import os
 from bisect import bisect_left
 from collections.abc import Callable, Iterable
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import accumulate
-from multiprocessing import get_context
 from pathlib import Path
 from typing import TypedDict
 
@@ -18,7 +15,6 @@ from .setup_models import download_diarization_models, model_cache_dir, whisper_
 
 SAMPLE_RATE = 16000
 UNKNOWN_SPEAKER = "unknown"
-_diarization_worker: ProcessPoolExecutor | None = None
 
 
 class PipelineError(RuntimeError):
@@ -123,12 +119,13 @@ def _load_diarizer(cache_dir: Path, speaker_count: int):
 
 
 @lru_cache(maxsize=1)
-def _load_whisper(model_name: str, cache_dir: Path):
+def _load_whisper(model_name: str, cache_dir: Path, cpu_threads: int):
     from faster_whisper import WhisperModel
 
     try:
         return WhisperModel(
-            model_name, device="cpu", compute_type="int8", download_root=str(cache_dir), use_auth_token=False,
+            model_name, device="cpu", compute_type="int8", cpu_threads=cpu_threads,
+            download_root=str(cache_dir), use_auth_token=False,
         )
     except Exception as error:
         raise PipelineError("Не удалось загрузить Whisper. Проверьте WHISPER_MODEL и доступность файлов модели.") from error
@@ -150,25 +147,10 @@ def _decode(path: Path):
     return samples
 
 
-def _compute_speaker_regions(samples, cache_dir: Path, expected_speakers: int) -> list[tuple[float, float, int]]:
-    diarizer = _load_diarizer(cache_dir, expected_speakers)
-    intervals = diarizer.process(samples).sort_by_start_time()
-    return [(turn.start, turn.end, turn.speaker) for turn in intervals]
-
-
 def _diarize(samples, expected_speakers: int | None, duration: float) -> tuple[list[SpeakerTurn], dict[str, str]]:
-    # Sherpa's Python binding holds the GIL while running native inference.
-    # A separate process keeps the API and its status polling responsive.
-    global _diarization_worker
-    if _diarization_worker is None:
-        _diarization_worker = ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn"))
     try:
-        job = _diarization_worker.submit(_compute_speaker_regions, samples, model_cache_dir(), expected_speakers or -1)
-        output = job.result()
-    except BrokenProcessPool as error:
-        _diarization_worker.shutdown(wait=False, cancel_futures=True)
-        _diarization_worker = None
-        raise PipelineError("Модуль диаризации завершился аварийно. Попробуйте обработать запись повторно.") from error
+        diarizer = _load_diarizer(model_cache_dir(), expected_speakers or -1)
+        intervals = diarizer.process(samples).sort_by_start_time()
     except PipelineError:
         raise
     except Exception as error:
@@ -177,9 +159,10 @@ def _diarize(samples, expected_speakers: int | None, duration: float) -> tuple[l
     ids: dict[int, str] = {}
     speakers: dict[str, str] = {}
     turns: list[SpeakerTurn] = []
-    for start, end, label in output:
-        start = max(0.0, start)
-        end = min(duration, end)
+    for interval in intervals:
+        start = max(0.0, float(interval.start))
+        end = min(duration, float(interval.end))
+        label = interval.speaker
         if end <= start:
             continue
         if label not in ids:
@@ -190,9 +173,9 @@ def _diarize(samples, expected_speakers: int | None, duration: float) -> tuple[l
     return turns, speakers
 
 
-def _whisper_words(samples, duration: float) -> Iterable[Word]:
+def _whisper_words(samples, duration: float, cpu_threads: int) -> Iterable[Word]:
     language = os.getenv("WHISPER_LANGUAGE", "ru").strip().lower()
-    whisper = _load_whisper(whisper_model_name(), model_cache_dir())
+    whisper = _load_whisper(whisper_model_name(), model_cache_dir(), cpu_threads)
     try:
         segments, _ = whisper.transcribe(
             samples,
@@ -214,7 +197,9 @@ def _whisper_words(samples, duration: float) -> Iterable[Word]:
         raise PipelineError("Whisper не смог расшифровать запись. Проверьте запись и параметр WHISPER_LANGUAGE.") from error
 
 
-def process_media(path: Path, speaker_count: int | None, on_stage: Callable[[str], None]) -> MeetingResult:
+def process_media(
+    path: Path, speaker_count: int | None, on_stage: Callable[[str], None], *, cpu_threads: int = 0,
+) -> MeetingResult:
     on_stage("decode")
     samples = _decode(path)
     duration = len(samples) / SAMPLE_RATE
@@ -223,7 +208,7 @@ def process_media(path: Path, speaker_count: int | None, on_stage: Callable[[str
     turns, speakers = _diarize(samples, speaker_count, duration)
 
     on_stage("transcribe")
-    segments = align_words(_whisper_words(samples, duration), turns)
+    segments = align_words(_whisper_words(samples, duration, cpu_threads), turns)
     if any(segment["speaker"] == UNKNOWN_SPEAKER for segment in segments):
         speakers[UNKNOWN_SPEAKER] = "Спикер не определён"
 

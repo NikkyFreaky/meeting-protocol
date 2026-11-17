@@ -3,7 +3,10 @@
 import asyncio
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import asynccontextmanager
+from multiprocessing import get_context
 from pathlib import Path
 from shutil import copyfileobj
 from typing import Annotated, Literal
@@ -97,7 +100,7 @@ class UploadTooLarge(MultiPartException):
     pass
 
 
-def process(storage, meeting):
+def process(storage, meeting, cpu_threads):
     from .pipeline import PipelineError, process_media
 
     meeting_id = meeting["id"]
@@ -106,6 +109,7 @@ def process(storage, meeting):
             storage.media_directory / meeting["media_file"],
             meeting["speaker_count"],
             lambda stage: storage.progress(meeting_id, stage),
+            cpu_threads=cpu_threads,
         )
         storage.complete(meeting_id, result)
     except PipelineError as error:
@@ -115,18 +119,36 @@ def process(storage, meeting):
         storage.fail(meeting_id, "Не удалось обработать запись. Подробности в журнале сервера.")
 
 
-async def run_worker(state):
-    while not state.stopping:
-        state.work_ready.clear()
-        meeting = await run_in_threadpool(state.storage.claim)
-        if meeting is None:
+async def claim_work(state):
+    # Keep one waiter responsible for clearing the event and checking SQLite.
+    async with state.claim_lock:
+        while not state.stopping:
+            state.work_ready.clear()
+            meeting = await run_in_threadpool(state.storage.claim)
+            if meeting is not None:
+                return meeting
             await state.work_ready.wait()
-        else:
+
+
+async def run_worker(state, cpu_threads):
+    loop = asyncio.get_running_loop()
+    context = get_context("spawn")
+    executor = ProcessPoolExecutor(max_workers=1, mp_context=context)
+    try:
+        while (meeting := await claim_work(state)) is not None:
             try:
-                await run_in_threadpool(process, state.storage, meeting)
-            except Exception:
+                await loop.run_in_executor(executor, process, state.storage, meeting, cpu_threads)
+            except Exception as error:
                 LOGGER.exception("Не удалось завершить обработку записи %s", meeting["id"])
-                await run_in_threadpool(state.storage.fail, meeting["id"], "Не удалось запустить обработку. Подробности в журнале сервера.")
+                if isinstance(error, BrokenProcessPool):
+                    await run_in_threadpool(executor.shutdown, wait=True, cancel_futures=True)
+                    executor = ProcessPoolExecutor(max_workers=1, mp_context=context)
+                await run_in_threadpool(
+                    state.storage.fail, meeting["id"],
+                    "Процесс обработки завершился с ошибкой. Подробности в журнале сервера.",
+                )
+    finally:
+        await run_in_threadpool(executor.shutdown, wait=True, cancel_futures=True)
 
 
 @asynccontextmanager
@@ -135,18 +157,23 @@ async def lifespan(app):
     max_upload_mb = int(os.getenv("MAX_UPLOAD_MB", "250"))
     if max_upload_mb < 1:
         raise ValueError("MAX_UPLOAD_MB должен быть положительным целым числом")
+    worker_count = int(os.getenv("MEETING_WORKERS", "2"))
+    if worker_count < 1:
+        raise ValueError("MEETING_WORKERS должен быть положительным целым числом")
+    cpu_threads = min(4, max(1, (os.cpu_count() or 1) // worker_count))
     app.state.storage = Storage(data_directory)
     app.state.storage.initialize()
     app.state.max_upload_mb = max_upload_mb
     app.state.work_ready = asyncio.Event()
+    app.state.claim_lock = asyncio.Lock()
     app.state.stopping = False
-    worker = asyncio.create_task(run_worker(app.state))
+    workers = [asyncio.create_task(run_worker(app.state, cpu_threads)) for _ in range(worker_count)]
     try:
         yield
     finally:
         app.state.stopping = True
         app.state.work_ready.set()
-        await worker
+        await asyncio.gather(*workers)
 
 
 app = FastAPI(title="Протокол совещаний", version="0.1.0", lifespan=lifespan)
