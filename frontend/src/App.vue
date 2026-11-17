@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import {
   Activity, ArrowLeft, ArrowRight, AudioLines,
-  CircleAlert, FileAudio, FileText, FolderOpen, LoaderCircle, Plus, UploadCloud, X,
+  CircleAlert, FileAudio, FileText, FolderOpen, LoaderCircle, Plus, Trash2, UploadCloud, X,
 } from '@lucide/vue'
 import { request, uploadMeeting } from './api.js'
 import { clock, fileSize, meetingDate, remainingTime, stageNames, statusNames } from './format.js'
@@ -16,6 +16,7 @@ const selectedId = ref(null)
 const meetingsLoaded = ref(false)
 const fileInput = ref(null)
 const history = ref(null)
+const historyHeading = ref(null)
 const uploadArea = ref(null)
 const selectedFile = ref(null)
 const title = ref('')
@@ -26,6 +27,11 @@ const progress = ref(0)
 const error = ref('')
 const historyError = ref('')
 const loadingMeeting = ref(false)
+const deleteDialog = ref(null)
+const deleteTarget = ref(null)
+const deleteBusy = ref(false)
+const deleteError = ref('')
+const deletedIds = new Set()
 let polling = false
 let timer
 let dragDepth = 0
@@ -83,6 +89,7 @@ function clearFile() {
 }
 
 function upsertMeeting(data) {
+  if (deletedIds.has(data.id)) return
   const exists = meetings.value.some((item) => item.id === data.id)
   meetings.value = exists ? meetings.value.map((item) => item.id === data.id ? data : item) :
     [data, ...meetings.value]
@@ -90,7 +97,7 @@ function upsertMeeting(data) {
 
 async function loadMeetings() {
   try {
-    meetings.value = await request('/meetings')
+    meetings.value = (await request('/meetings')).filter((item) => !deletedIds.has(item.id))
     if (meeting.value) upsertMeeting(meeting.value)
     meetingsLoaded.value = true
     historyError.value = ''
@@ -159,6 +166,35 @@ async function openDemo() {
     error.value = err.message
   } finally {
     busy.value = ''
+  }
+}
+
+function openDeleteDialog(item) {
+  deleteTarget.value = item
+  deleteError.value = ''
+  deleteDialog.value.showModal()
+}
+
+function onDeleteCancel(event) {
+  if (deleteBusy.value) event.preventDefault()
+}
+
+async function confirmDelete() {
+  if (!deleteTarget.value || deleteBusy.value) return
+  const id = deleteTarget.value.id
+  deleteBusy.value = true
+  deleteError.value = ''
+  try {
+    await request(`/meetings/${id}`, { method: 'DELETE' })
+    deletedIds.add(id)
+    meetings.value = meetings.value.filter((item) => item.id !== id)
+    deleteDialog.value.close()
+    await nextTick()
+    historyHeading.value?.focus()
+  } catch (err) {
+    deleteError.value = err.message
+  } finally {
+    deleteBusy.value = false
   }
 }
 
@@ -284,7 +320,7 @@ function updateMeeting(data) {
 
           <section ref="history" class="history" aria-labelledby="history-title">
             <div class="section-heading">
-              <h2 id="history-title">История записей</h2>
+              <h2 ref="historyHeading" id="history-title" tabindex="-1">История записей</h2>
               <span v-if="meetings.length" class="count-pill">{{ meetings.length }}</span>
             </div>
             <div v-if="historyError" class="card history-empty">
@@ -299,15 +335,19 @@ function updateMeeting(data) {
               <div><strong>Записей пока нет</strong><small>Загруженные совещания появятся здесь.</small></div>
             </div>
             <div v-else class="history-list card">
-              <button v-for="item in meetings" :key="item.id" class="history-item" type="button" @click="openMeeting(item.id)">
-                <span class="item-icon"><FileText :size="20" /></span>
-                <span class="history-item-name">
-                  <strong>{{ item.title }}</strong>
-                  <small>{{ meetingDate(item.created_at) }}<template v-if="item.duration"> · {{ clock(item.duration) }}</template><template v-if="item.demo"> · Пример</template><template v-if="item.eta_seconds"> · Осталось {{ remainingTime(item.eta_seconds) }}</template></small>
-                </span>
-                <span :class="['status-pill', item.status]">{{ statusNames[item.status] }}</span>
-                <ArrowRight class="history-arrow" :size="17" />
-              </button>
+              <div v-for="item in meetings" :key="item.id" class="history-row">
+                <button class="history-item" type="button" @click="openMeeting(item.id)">
+                  <span class="item-icon"><FileText :size="20" /></span>
+                  <span class="history-item-name">
+                    <strong>{{ item.title }}</strong>
+                    <small>{{ meetingDate(item.created_at) }}<template v-if="item.duration"> · {{ clock(item.duration) }}</template><template v-if="item.demo"> · Пример</template><template v-if="item.eta_seconds"> · Осталось {{ remainingTime(item.eta_seconds) }}</template></small>
+                  </span>
+                  <span :class="['status-pill', item.status]">{{ statusNames[item.status] }}</span>
+                  <ArrowRight class="history-arrow" :size="17" />
+                </button>
+                <button v-if="config.deletion_enabled" class="icon-button history-delete" type="button" :aria-label="`Удалить запись «${item.title}»`"
+                  title="Удалить запись" @click="openDeleteDialog(item)"><Trash2 :size="17" /></button>
+              </div>
             </div>
           </section>
         </template>
@@ -347,5 +387,22 @@ function updateMeeting(data) {
         </template>
       </main>
     </div>
+    <dialog ref="deleteDialog" class="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description"
+      @cancel="onDeleteCancel" @close="deleteTarget = null">
+      <h2 id="delete-title">Удалить запись?</h2>
+      <p id="delete-description">
+        <strong>«{{ deleteTarget?.title }}».</strong>
+        <template v-if="deleteTarget?.demo"> Все сохранённые копии примера будут удалены. Пример можно открыть заново.</template>
+        <template v-else> Запись, расшифровка и протокол будут удалены. Уже созданные карточки YouGile останутся.</template>
+        <template v-if="deleteTarget?.status === 'processing'"> Обработка остановится после текущего этапа.</template>
+      </p>
+      <p v-if="deleteError" class="error-message" role="alert">{{ deleteError }}</p>
+      <form method="dialog" class="delete-actions">
+        <button class="button button-secondary" type="submit" :disabled="deleteBusy" autofocus>Отмена</button>
+        <button class="button button-danger" type="button" :disabled="deleteBusy" @click="confirmDelete">
+          <LoaderCircle v-if="deleteBusy" class="spin" :size="17" /> {{ deleteBusy ? 'Удаляем…' : 'Удалить' }}
+        </button>
+      </form>
+    </dialog>
   </div>
 </template>

@@ -102,19 +102,30 @@ class UploadTooLarge(MultiPartException):
     pass
 
 
+class MeetingDeleted(Exception):
+    pass
+
+
 def process(storage, meeting, cpu_threads):
     from .pipeline import PipelineError, process_media
 
     meeting_id = meeting["id"]
+
+    def report_stage(stage):
+        if not storage.progress(meeting_id, stage):
+            raise MeetingDeleted
+
     try:
         result = process_media(
             storage.media_directory / meeting["media_file"],
             meeting["speaker_count"],
-            lambda stage: storage.progress(meeting_id, stage),
+            report_stage,
             cpu_threads=cpu_threads,
             on_duration=lambda duration: storage.set_duration(meeting_id, duration),
         )
         storage.complete(meeting_id, result)
+    except MeetingDeleted:
+        return
     except PipelineError as error:
         storage.fail(meeting_id, str(error))
     except Exception:
@@ -130,7 +141,10 @@ async def claim_work(state):
             meeting = await run_in_threadpool(state.storage.claim)
             if meeting is not None:
                 return meeting
-            await state.work_ready.wait()
+            try:
+                await asyncio.wait_for(state.work_ready.wait(), timeout=10)
+            except TimeoutError:
+                await run_in_threadpool(state.storage.purge_deleted)
 
 
 async def run_worker(state, cpu_threads):
@@ -150,6 +164,8 @@ async def run_worker(state, cpu_threads):
                     state.storage.fail, meeting["id"],
                     "Процесс обработки завершился с ошибкой. Подробности в журнале сервера.",
                 )
+            finally:
+                await run_in_threadpool(state.storage.release_deleted, meeting["id"])
     finally:
         await run_in_threadpool(executor.shutdown, wait=True, cancel_futures=True)
 
@@ -280,6 +296,7 @@ def config(request: Request):
         "extensions": list(MEDIA_TYPES),
         "integration_enabled": integration_enabled(),
         "demo_enabled": True,
+        "deletion_enabled": True,
     }
 
 
@@ -335,6 +352,15 @@ def detail(meeting_id: str, request: Request):
     return {**public_meeting(meeting, rate), "deliveries": storage.deliveries(meeting_id)}
 
 
+@app.delete("/api/meetings/{meeting_id}")
+def delete_meeting(meeting_id: str, request: Request):
+    storage = request.app.state.storage
+    if storage.mark_for_deletion(meeting_id) == "sending":
+        raise HTTPException(409, "Дождитесь завершения отправки поручений и повторите удаление.")
+    storage.purge_deleted()
+    return {"deleted": True}
+
+
 @app.patch("/api/meetings/{meeting_id}")
 def edit_meeting(meeting_id: str, edit: MeetingEdit, request: Request):
     storage = request.app.state.storage
@@ -344,7 +370,10 @@ def edit_meeting(meeting_id: str, edit: MeetingEdit, request: Request):
         if selected_speakers.keys() - meeting["speakers"].keys():
             raise HTTPException(422, "Один из участников отсутствует в записи.")
     protocol = edit.protocol.model_dump() if edit.protocol is not None else None
-    updated = public_meeting(storage.edit(meeting_id, selected_speakers, protocol))
+    edited = storage.edit(meeting_id, selected_speakers, protocol)
+    if edited is None:
+        raise HTTPException(404, "Совещание не найдено.")
+    updated = public_meeting(edited)
     return {**updated, "deliveries": storage.deliveries(meeting_id)}
 
 
@@ -393,6 +422,8 @@ def deliver_tasks(meeting_id: str, selection: TaskSelection, request: Request):
             continue
         previous = storage.reserve_task(meeting_id, task_id)
         if previous is not None:
+            if previous["status"] == "unavailable":
+                raise HTTPException(404, "Совещание не найдено.")
             if previous["status"] == "sent":
                 sent.append({"task_id": task_id, "external_id": previous["external_id"], "url": previous["url"]})
             else:

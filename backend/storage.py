@@ -1,12 +1,16 @@
 """Persistent meetings, processing jobs and delivery receipts for one local server."""
 
 import json
+import logging
 import sqlite3
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import median
 from time import time
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def utc_now() -> str:
@@ -71,6 +75,8 @@ class Storage:
             """)
             # An interrupted HTTP request may already have created a remote task.
             connection.execute("UPDATE task_deliveries SET status = 'uncertain' WHERE status = 'sending'")
+            connection.execute("UPDATE meetings SET status = 'purging' WHERE status = 'deleting'")
+        self.purge_deleted()
 
     @staticmethod
     def decode(row):
@@ -91,7 +97,8 @@ class Storage:
             if result is not None:
                 connection.execute("BEGIN IMMEDIATE")
                 existing = connection.execute("""
-                    SELECT * FROM meetings WHERE demo = 1 ORDER BY created_at DESC, rowid DESC LIMIT 1
+                    SELECT * FROM meetings WHERE demo = 1 AND status = 'completed'
+                    ORDER BY created_at DESC, rowid DESC LIMIT 1
                 """).fetchone()
                 if existing is not None:
                     return self.decode(existing)
@@ -117,16 +124,58 @@ class Storage:
                 SELECT id, title, filename, media_file, created_at, status, stage, error, duration, demo,
                     processing_started_at
                 FROM meetings
-                WHERE demo = 0 OR id = (
-                    SELECT id FROM meetings WHERE demo = 1 ORDER BY created_at DESC, rowid DESC LIMIT 1
-                )
+                WHERE status NOT IN ('deleting', 'purging') AND (demo = 0 OR id = (
+                    SELECT id FROM meetings WHERE demo = 1 AND status = 'completed'
+                    ORDER BY created_at DESC, rowid DESC LIMIT 1
+                ))
                 ORDER BY created_at DESC, rowid DESC
             """).fetchall()
         return [self.decode(row) for row in rows]
 
     def get(self, meeting_id):
         with self.connection() as connection:
-            return self.decode(connection.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,)).fetchone())
+            return self.decode(connection.execute("""
+                SELECT * FROM meetings WHERE id = ? AND status NOT IN ('deleting', 'purging')
+            """, (meeting_id,)).fetchone())
+
+    def mark_for_deletion(self, meeting_id):
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT status, demo FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+            if row is None or row["status"] in {"deleting", "purging"}:
+                return "accepted"
+            if connection.execute("""
+                SELECT 1 FROM task_deliveries WHERE meeting_id = ? AND status = 'sending' LIMIT 1
+            """, (meeting_id,)).fetchone():
+                return "sending"
+            if row["demo"]:
+                # Retiring the visible example must not reveal older copies.
+                connection.execute("UPDATE meetings SET status = 'purging' WHERE demo = 1")
+            else:
+                status = "deleting" if row["status"] == "processing" else "purging"
+                connection.execute("UPDATE meetings SET status = ? WHERE id = ?", (status, meeting_id))
+        return "accepted"
+
+    def release_deleted(self, meeting_id):
+        with self.connection() as connection:
+            result = connection.execute("""
+                UPDATE meetings SET status = 'purging' WHERE id = ? AND status = 'deleting'
+            """, (meeting_id,))
+        if result.rowcount:
+            self.purge_deleted()
+
+    def purge_deleted(self):
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for row in connection.execute("SELECT id, media_file FROM meetings WHERE status = 'purging'").fetchall():
+                if row["media_file"]:
+                    try:
+                        (self.media_directory / row["media_file"]).unlink(missing_ok=True)
+                    except OSError:
+                        LOGGER.warning("Файл удалённой записи %s пока недоступен для удаления", row["id"])
+                        continue
+                connection.execute("DELETE FROM task_deliveries WHERE meeting_id = ?", (row["id"],))
+                connection.execute("DELETE FROM meetings WHERE id = ?", (row["id"],))
 
     def claim(self):
         with self.connection() as connection:
@@ -140,7 +189,8 @@ class Storage:
 
     def progress(self, meeting_id, stage):
         with self.connection() as connection:
-            connection.execute("UPDATE meetings SET stage = ? WHERE id = ? AND status = 'processing'", (stage, meeting_id))
+            result = connection.execute("UPDATE meetings SET stage = ? WHERE id = ? AND status = 'processing'", (stage, meeting_id))
+            return bool(result.rowcount)
 
     def set_duration(self, meeting_id, duration):
         with self.connection() as connection:
@@ -198,6 +248,11 @@ class Storage:
 
     def reserve_task(self, meeting_id, task_id):
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if not connection.execute("""
+                SELECT 1 FROM meetings WHERE id = ? AND status = 'completed'
+            """, (meeting_id,)).fetchone():
+                return {"status": "unavailable"}
             inserted = connection.execute("""
                 INSERT INTO task_deliveries (meeting_id, task_id, status) VALUES (?, ?, 'sending')
                 ON CONFLICT (meeting_id, task_id) DO NOTHING
