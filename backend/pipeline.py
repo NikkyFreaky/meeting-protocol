@@ -2,6 +2,7 @@
 
 import os
 from bisect import bisect_left
+from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -16,6 +17,9 @@ from .setup_models import download_diarization_models, model_cache_dir, whisper_
 
 SAMPLE_RATE = 16000
 UNKNOWN_SPEAKER = "unknown"
+DIARIZATION_THRESHOLD = 0.90
+DIARIZATION_WINDOW_SHIFT_RATIO = 0.35
+MIN_AUTOMATIC_SPEAKER_SECONDS = 2.0
 ProgressLog = Callable[[str, str], None]
 
 
@@ -95,7 +99,7 @@ def align_words(words: Iterable[Word], turns: list[SpeakerTurn]) -> list[Transcr
 
 
 @lru_cache(maxsize=1)
-def _load_diarizer(cache_dir: Path, speaker_count: int):
+def _load_diarizer(cache_dir: Path, speaker_count: int, cpu_threads: int):
     try:
         import sherpa_onnx
     except (ImportError, OSError) as error:
@@ -108,10 +112,13 @@ def _load_diarizer(cache_dir: Path, speaker_count: int):
 
     config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
         segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
-            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=segmentation_path),
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                model=segmentation_path, window_shift_ratio=DIARIZATION_WINDOW_SHIFT_RATIO,
+            ),
+            num_threads=cpu_threads,
         ),
-        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=embedding_path),
-        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=speaker_count, threshold=0.55),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=embedding_path, num_threads=cpu_threads),
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=speaker_count, threshold=DIARIZATION_THRESHOLD),
         min_duration_on=0.3,
         min_duration_off=0.5,
     )
@@ -149,7 +156,9 @@ def _decode(path: Path):
     return samples
 
 
-def _diarize(samples, expected_speakers: int | None, duration: float, log: ProgressLog) -> tuple[list[SpeakerTurn], dict[str, str]]:
+def _diarize(
+    samples, expected_speakers: int | None, duration: float, log: ProgressLog, *, cpu_threads: int = 2,
+) -> tuple[list[SpeakerTurn], dict[str, str]]:
     last_report = float("-inf")
 
     def report_chunks(processed, total):
@@ -162,7 +171,7 @@ def _diarize(samples, expected_speakers: int | None, duration: float, log: Progr
 
     try:
         log("info", "Подготавливаем модель Sherpa ONNX.")
-        diarizer = _load_diarizer(model_cache_dir(), expected_speakers or -1)
+        diarizer = _load_diarizer(model_cache_dir(), expected_speakers or -1, cpu_threads)
         mode = f"задано число участников: {expected_speakers}" if expected_speakers else "число участников определяется автоматически"
         log("info", f"Анализируем голоса и паузы, {mode}.")
         intervals = diarizer.process(samples, callback=report_chunks).sort_by_start_time()
@@ -174,11 +183,26 @@ def _diarize(samples, expected_speakers: int | None, duration: float, log: Progr
     ids: dict[int, str] = {}
     speakers: dict[str, str] = {}
     turns: list[SpeakerTurn] = []
+    regions = []
+    speaker_seconds = Counter()
     for interval in intervals:
         start = max(0.0, float(interval.start))
         end = min(duration, float(interval.end))
-        label = interval.speaker
         if end <= start:
+            continue
+        regions.append((start, end, interval.speaker))
+        speaker_seconds[interval.speaker] += end - start
+
+    # Keep the audio and transcript attributed to these regions, but don't
+    # claim a separate identity from a fleeting cluster in automatic mode.
+    uncertain: set[int] = set()
+    if expected_speakers is None:
+        uncertain = {label for label, seconds in speaker_seconds.items() if seconds < MIN_AUTOMATIC_SPEAKER_SECONDS}
+    if uncertain:
+        log("info", f"Короткие группы без надёжной метки голоса: {len(uncertain)}. Реплики будут помечены как неопределённые.")
+    for start, end, label in regions:
+        if label in uncertain:
+            turns.append(SpeakerTurn(start, end, UNKNOWN_SPEAKER))
             continue
         if label not in ids:
             number = len(ids) + 1
@@ -239,12 +263,14 @@ def process_media(
     log("done", f"Аудиодорожка готова. Длительность: {duration:.1f} с.")
 
     on_stage("diarize")
-    turns, speakers = _diarize(samples, speaker_count, duration, log)
+    turns, speakers = _diarize(samples, speaker_count, duration, log, cpu_threads=min(cpu_threads or 2, 2))
     log("done", f"Выделено голосов: {len(speakers)}. Интервалов речи: {len(turns)}.")
 
     on_stage("transcribe")
     segments = align_words(_whisper_words(samples, duration, cpu_threads, log), turns)
-    if any(segment["speaker"] == UNKNOWN_SPEAKER for segment in segments):
+    transcript_speakers = {segment["speaker"] for segment in segments}
+    speakers = {speaker: name for speaker, name in speakers.items() if speaker in transcript_speakers}
+    if UNKNOWN_SPEAKER in transcript_speakers:
         speakers[UNKNOWN_SPEAKER] = "Спикер не определён"
     log("done", f"Сверили временные метки слов и говорящих. Реплик в стенограмме: {len(segments)}.")
 

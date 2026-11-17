@@ -2,9 +2,9 @@
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import {
   Activity, ArrowLeft, ArrowRight, AudioLines,
-  CircleAlert, FileAudio, FileText, FolderOpen, LoaderCircle, Plus, Trash2, UploadCloud, X,
+  CircleAlert, FileAudio, FileText, FolderOpen, LoaderCircle, Plus, RotateCcw, Trash2, UploadCloud, X,
 } from '@lucide/vue'
-import { request, uploadMeeting } from './api.js'
+import { jsonRequest, request, uploadMeeting } from './api.js'
 import { clock, fileSize, meetingDate, remainingTime, stageNames, statusNames } from './format.js'
 import MeetingDetail from './MeetingDetail.vue'
 import ProcessingJournal from './ProcessingJournal.vue'
@@ -33,6 +33,10 @@ const deleteTarget = ref(null)
 const deleteBusy = ref(false)
 const deleteError = ref('')
 const deletedIds = new Set()
+const retryDialog = ref(null)
+const retrySpeakerCount = ref('')
+const retryBusy = ref(false)
+const retryError = ref('')
 let polling = false
 let timer
 let dragDepth = 0
@@ -40,6 +44,8 @@ let dragDepth = 0
 const extensions = computed(() => config.value.extensions?.length ? config.value.extensions : defaultExtensions)
 const activeMeeting = computed(() => !!selectedId.value)
 const estimate = computed(() => remainingTime(meeting.value?.eta_seconds))
+const canRetry = computed(() => config.value.reprocessing_enabled && meeting.value?.media_url
+  && !meeting.value.demo && ['completed', 'failed'].includes(meeting.value.status))
 
 function setFile(file) {
   if (!file || busy.value) return
@@ -172,6 +178,29 @@ function openDeleteDialog(item) {
   deleteTarget.value = item
   deleteError.value = ''
   deleteDialog.value.showModal()
+}
+
+function openRetryDialog() {
+  retrySpeakerCount.value = meeting.value.speaker_count ?? ''
+  retryError.value = ''
+  retryDialog.value.showModal()
+}
+
+async function retryMeeting() {
+  if (retryBusy.value || !canRetry.value) return
+  retryBusy.value = true
+  retryError.value = ''
+  try {
+    const result = await jsonRequest(`/meetings/${meeting.value.id}/reprocess`, 'POST', {
+      speaker_count: retrySpeakerCount.value === '' ? null : Number(retrySpeakerCount.value),
+    })
+    retryDialog.value.close()
+    await openMeeting(result.id, result)
+  } catch (err) {
+    retryError.value = err.message
+  } finally {
+    retryBusy.value = false
+  }
 }
 
 function onDeleteCancel(event) {
@@ -352,7 +381,12 @@ function updateMeeting(data) {
         </template>
 
         <template v-else>
-          <button type="button" class="back-link" @click="goHome('history')"><ArrowLeft :size="17" /> Все совещания</button>
+          <div class="record-navigation">
+            <button type="button" class="back-link" @click="goHome('history')"><ArrowLeft :size="17" /> Все совещания</button>
+            <button v-if="canRetry" type="button" class="button button-small button-secondary" @click="openRetryDialog">
+              <RotateCcw :size="15" /> Повторить обработку
+            </button>
+          </div>
           <p v-if="loadingMeeting" class="inline-info"><LoaderCircle class="spin" :size="19" /> Загружаем совещание…</p>
           <p v-if="error" class="error-message" role="alert"><CircleAlert :size="18" /> {{ error }}</p>
           <MeetingDetail v-if="meeting?.status === 'completed'" :key="meeting.id" :meeting="meeting"
@@ -397,6 +431,21 @@ function updateMeeting(data) {
         <button class="button button-danger" type="button" :disabled="deleteBusy" @click="confirmDelete">
           <LoaderCircle v-if="deleteBusy" class="spin" :size="17" /> {{ deleteBusy ? 'Удаляем…' : 'Удалить' }}
         </button>
+      </form>
+    </dialog>
+    <dialog ref="retryDialog" class="delete-dialog" aria-labelledby="retry-title" aria-describedby="retry-description"
+      @cancel="retryBusy && $event.preventDefault()">
+      <h2 id="retry-title">Повторить обработку?</h2>
+      <p id="retry-description">Новый результат появится отдельной строкой в истории. Укажите число людей, которые говорили на записи, если оно известно.</p>
+      <form class="retry-form" @submit.prevent="retryMeeting">
+        <label>Число говорящих
+          <input v-model="retrySpeakerCount" type="number" min="1" max="20" placeholder="Автоматически" :disabled="retryBusy" autofocus />
+        </label>
+        <p v-if="retryError" class="error-message" role="alert">{{ retryError }}</p>
+        <div class="delete-actions">
+          <button class="button button-secondary" type="button" :disabled="retryBusy" @click="retryDialog.close()">Отмена</button>
+          <button class="button button-primary" type="submit" :disabled="retryBusy">{{ retryBusy ? 'Готовим запись…' : 'Начать обработку' }}</button>
+        </div>
       </form>
     </dialog>
   </div>
