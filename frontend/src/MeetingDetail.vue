@@ -132,7 +132,7 @@ async function sendTasks() {
     })
     for (const receipt of result.sent) recentDeliveries.value[receipt.task_id] = receipt
     checked.value = unsentSelection.value
-    if (result.sent.length) feedback.value = `Отправлено в YouGile: ${result.sent.length}.`
+    if (result.sent.length) feedback.value = `Отправлено в трекер: ${result.sent.length}.`
     if (result.failed.length) {
       actionError.value = result.failed.map((item) => {
         const title = protocol.value.tasks.find((task) => task.id === item.task_id)?.title
@@ -248,7 +248,7 @@ async function sendTasks() {
           <button v-if="!draft && protocol.tasks.length" type="button" class="button button-small button-primary"
             :disabled="!integrationEnabled || !unsentSelection.length || !!working" @click="sendTasks">
             <LoaderCircle v-if="working === 'send'" class="spin" :size="15" /><Send v-else :size="15" />
-            В YouGile<template v-if="unsentSelection.length"> · {{ unsentSelection.length }}</template>
+            В трекер<template v-if="unsentSelection.length"> · {{ unsentSelection.length }}</template>
           </button>
         </div>
         <template v-if="draft">
@@ -270,8 +270,8 @@ async function sendTasks() {
               <div class="task-content">
                 <strong>{{ task.title }}</strong>
                 <small>{{ task.assignee || 'Без ответственного' }} · {{ task.due_date || 'Без срока' }}</small>
-                <a v-if="sent[task.id]?.url" class="tracker-link" :href="sent[task.id].url" target="_blank" rel="noopener noreferrer">YouGile <ArrowUpRight :size="14" /></a>
-                <small v-else-if="sent[task.id]" class="sent-check">Отправлено в YouGile</small>
+                <a v-if="sent[task.id]?.url" class="tracker-link" :href="sent[task.id].url" target="_blank" rel="noopener noreferrer">Открыть карточку <ArrowUpRight :size="14" /></a>
+                <small v-else-if="sent[task.id]" class="sent-check" :title="sent[task.id].external_id">Отправлено в трекер</small>
               </div>
               <button v-if="meeting.media_url && task.at != null" type="button" class="timestamp" @click="jump(task.at)">
                 <Play :size="12" /> {{ clock(task.at) }}
