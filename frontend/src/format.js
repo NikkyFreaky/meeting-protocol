@@ -19,6 +19,18 @@ export function clock(seconds) {
   return value >= 3600 ? `${Math.floor(value / 3600)}:${tail}` : tail
 }
 
+export function remainingTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return ''
+  const rounded = Math.ceil(seconds / 10) * 10
+  if (rounded < 60) return `≈ ${rounded} с`
+  if (rounded < 120) return rounded === 60 ? '≈ 1 мин' : `≈ 1 мин ${rounded - 60} с`
+  const minutes = Math.round(rounded / 60)
+  if (minutes < 60) return `≈ ${minutes} мин`
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+  return rest ? `≈ ${hours} ч ${rest} мин` : `≈ ${hours} ч`
+}
+
 export function meetingDate(value) {
   if (!value) return ''
   const date = new Date(value)

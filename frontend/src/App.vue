@@ -5,7 +5,7 @@ import {
   CircleAlert, FileAudio, FileText, FolderOpen, LoaderCircle, Plus, UploadCloud, X,
 } from '@lucide/vue'
 import { request, uploadMeeting } from './api.js'
-import { clock, fileSize, meetingDate, stageNames, statusNames } from './format.js'
+import { clock, fileSize, meetingDate, remainingTime, stageNames, statusNames } from './format.js'
 import MeetingDetail from './MeetingDetail.vue'
 
 const defaultExtensions = ['.mp3', '.wav', '.m4a', '.flac', '.aac', '.ogg', '.opus', '.mp4', '.webm', '.mov', '.mkv']
@@ -34,6 +34,7 @@ const extensions = computed(() => config.value.extensions?.length ? config.value
 const stages = Object.entries(stageNames)
 const stageIndex = computed(() => stages.findIndex(([id]) => id === meeting.value?.stage))
 const activeMeeting = computed(() => !!selectedId.value)
+const estimate = computed(() => remainingTime(meeting.value?.eta_seconds))
 
 function setFile(file) {
   if (!file || busy.value) return
@@ -302,7 +303,7 @@ function updateMeeting(data) {
                 <span class="item-icon"><FileText :size="20" /></span>
                 <span class="history-item-name">
                   <strong>{{ item.title }}</strong>
-                  <small>{{ meetingDate(item.created_at) }}<template v-if="item.duration"> · {{ clock(item.duration) }}</template><template v-if="item.demo"> · Пример</template></small>
+                  <small>{{ meetingDate(item.created_at) }}<template v-if="item.duration"> · {{ clock(item.duration) }}</template><template v-if="item.demo"> · Пример</template><template v-if="item.eta_seconds"> · Осталось {{ remainingTime(item.eta_seconds) }}</template></small>
                 </span>
                 <span :class="['status-pill', item.status]">{{ statusNames[item.status] }}</span>
                 <ArrowRight class="history-arrow" :size="17" />
@@ -322,16 +323,19 @@ function updateMeeting(data) {
               <h1>{{ meeting.title }}</h1>
               <p>{{ meeting.filename }}</p>
             </section>
-            <section v-if="meeting.status === 'failed'" class="card processing">
+            <section v-if="meeting.status === 'failed'" class="card processing-card">
               <span class="heading-icon failure"><CircleAlert :size="22" /></span>
               <h2>Не удалось обработать запись</h2>
               <p>{{ meeting.error || 'Загрузите запись повторно.' }}</p>
               <button class="button button-secondary" type="button" @click="goHome('upload')"><UploadCloud :size="17" /> Загрузить запись</button>
             </section>
-            <section v-else class="card processing" aria-live="polite">
+            <section v-else class="card processing-card" aria-live="polite">
               <span class="heading-icon"><LoaderCircle :size="22" class="spin" /></span>
               <h2>{{ meeting.status === 'queued' ? 'Запись в очереди' : (stageNames[meeting.stage] || 'Обработка записи') }}</h2>
-              <p>Вы можете вернуться к записи через историю совещаний.</p>
+              <p v-if="meeting.status === 'queued'">Обработка начнётся, когда освободится процесс.</p>
+              <p v-else-if="estimate">Осталось {{ estimate }}</p>
+              <p v-else-if="meeting.stage === 'decode'">Оценка появится после подготовки аудиодорожки.</p>
+              <p v-else>Обработка продолжается. Уточняем время.</p>
               <ol class="stage-list">
                 <li v-for="([id, name], index) in stages" :key="id"
                   :class="{ 'stage-current': index === stageIndex, 'stage-done': index < stageIndex }">
