@@ -17,6 +17,7 @@ from .setup_models import download_diarization_models, model_cache_dir, whisper_
 
 SAMPLE_RATE = 16000
 UNKNOWN_SPEAKER = "unknown"
+PYANNOTE_MODEL = "pyannote/speaker-diarization-community-1"
 DIARIZATION_THRESHOLD = 0.90
 DIARIZATION_WINDOW_SHIFT_RATIO = 0.35
 MIN_AUTOMATIC_SPEAKER_SECONDS = 2.0
@@ -127,6 +128,57 @@ def _load_diarizer(cache_dir: Path, speaker_count: int, cpu_threads: int):
     return sherpa_onnx.OfflineSpeakerDiarization(config)
 
 
+def _diarization_backend() -> str:
+    backend = os.getenv("DIARIZATION_BACKEND", "pyannote").strip().lower()
+    if backend not in ("pyannote", "sherpa"):
+        raise PipelineError("DIARIZATION_BACKEND должен быть pyannote или sherpa.")
+    return backend
+
+
+def _pyannote_device() -> str:
+    device = os.getenv("DIARIZATION_DEVICE", "auto").strip().lower()
+    if device not in ("auto", "cuda", "cpu"):
+        raise PipelineError("DIARIZATION_DEVICE должен быть auto, cuda или cpu.")
+    if device == "cpu":
+        return device
+    try:
+        import torch
+    except (ImportError, OSError) as error:
+        raise PipelineError("Не удалось загрузить PyTorch для pyannote.audio.") from error
+    if torch.cuda.is_available():
+        return "cuda"
+    if device == "cuda":
+        raise PipelineError("CUDA недоступна. Проверьте драйвер NVIDIA и установку PyTorch с CUDA.")
+    return "cpu"
+
+
+@lru_cache(maxsize=1)
+def _load_pyannote(cache_dir: Path, device: str):
+    os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
+    os.environ.setdefault("HF_XET_CACHE", str(cache_dir / "xet"))
+    try:
+        import torch
+        from pyannote.audio import Pipeline
+    except (ImportError, OSError) as error:
+        raise PipelineError("Не удалось загрузить pyannote.audio. Установите зависимости из requirements-ml.txt.") from error
+
+    checkpoint = os.getenv("PYANNOTE_MODEL_PATH", "").strip() or PYANNOTE_MODEL
+    model_error = "Не удалось загрузить Community-1. Проверьте доступ к модели и HF_TOKEN или путь PYANNOTE_MODEL_PATH."
+    try:
+        diarizer = Pipeline.from_pretrained(
+            checkpoint, token=os.getenv("HF_TOKEN") or None, cache_dir=cache_dir,
+        )
+    except Exception as error:
+        raise PipelineError(model_error) from error
+    if diarizer is None:
+        raise PipelineError(model_error)
+    try:
+        diarizer.to(torch.device(device))
+    except Exception as error:
+        raise PipelineError(f"Не удалось запустить pyannote.audio на {device.upper()}. Проверьте PyTorch и доступную память.") from error
+    return diarizer
+
+
 @lru_cache(maxsize=1)
 def _load_whisper(model_name: str, cache_dir: Path, cpu_threads: int):
     from faster_whisper import WhisperModel
@@ -161,41 +213,66 @@ def _diarize(
 ) -> tuple[list[SpeakerTurn], dict[str, str]]:
     last_report = float("-inf")
 
-    def report_chunks(processed, total):
+    def report_progress(step, processed, total):
         nonlocal last_report
         now = monotonic()
         if total > 0 and (processed == total or now - last_report >= 10):
-            log("info", f"Диаризация: обработано фрагментов {processed} из {total}.")
+            log("info", f"Диаризация, {step}: {processed} из {total}.")
             last_report = now
+
+    def report_chunks(processed, total):
+        report_progress("фрагменты", processed, total)
         return 0
 
+    def pyannote_hook(step_name, _artefact, *, file=None, completed=None, total=None):
+        steps = {"segmentation": "сегментация", "embeddings": "анализ голосов"}
+        if completed is not None and total is not None:
+            report_progress(steps.get(step_name, step_name), completed, total)
+
     try:
-        log("info", "Подготавливаем модель Sherpa ONNX.")
-        diarizer = _load_diarizer(model_cache_dir(), expected_speakers or -1, cpu_threads)
         mode = f"задано число участников: {expected_speakers}" if expected_speakers else "число участников определяется автоматически"
-        log("info", f"Анализируем голоса и паузы, {mode}.")
-        intervals = diarizer.process(samples, callback=report_chunks).sort_by_start_time()
+        if _diarization_backend() == "sherpa":
+            log("info", "Подготавливаем модель Sherpa ONNX (CPU).")
+            diarizer = _load_diarizer(model_cache_dir(), expected_speakers or -1, cpu_threads)
+            log("info", f"Анализируем голоса и паузы, {mode}.")
+            intervals = (
+                (interval.start, interval.end, str(interval.speaker))
+                for interval in diarizer.process(samples, callback=report_chunks).sort_by_start_time()
+            )
+        else:
+            device = _pyannote_device()
+            log("info", f"Подготавливаем модель pyannote.audio Community-1 ({device.upper()}).")
+            diarizer = _load_pyannote(model_cache_dir(), device)
+            import torch
+
+            log("info", f"Анализируем голоса и паузы, {mode}.")
+            audio = {"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": SAMPLE_RATE}
+            options = {"num_speakers": expected_speakers} if expected_speakers is not None else {}
+            output = diarizer(audio, hook=pyannote_hook, **options)
+            intervals = sorted(
+                (segment.start, segment.end, label) for segment, label in output.exclusive_speaker_diarization
+            )
     except PipelineError:
         raise
     except Exception as error:
         raise PipelineError("Модель не смогла разделить запись на спикеров.") from error
 
-    ids: dict[int, str] = {}
+    ids: dict[str, str] = {}
     speakers: dict[str, str] = {}
     turns: list[SpeakerTurn] = []
     regions = []
     speaker_seconds = Counter()
-    for interval in intervals:
-        start = max(0.0, float(interval.start))
-        end = min(duration, float(interval.end))
+    for start, end, label in intervals:
+        start = max(0.0, float(start))
+        end = min(duration, float(end))
         if end <= start:
             continue
-        regions.append((start, end, interval.speaker))
-        speaker_seconds[interval.speaker] += end - start
+        regions.append((start, end, label))
+        speaker_seconds[label] += end - start
 
     # Keep the audio and transcript attributed to these regions, but don't
     # claim a separate identity from a fleeting cluster in automatic mode.
-    uncertain: set[int] = set()
+    uncertain: set[str] = set()
     if expected_speakers is None:
         uncertain = {label for label, seconds in speaker_seconds.items() if seconds < MIN_AUTOMATIC_SPEAKER_SECONDS}
     if uncertain:

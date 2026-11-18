@@ -1,4 +1,4 @@
-"""Download the public model weights in advance with python -m backend.setup_models."""
+"""Prepare model weights with python -m backend.setup_models."""
 
 import os
 from pathlib import Path
@@ -33,9 +33,14 @@ def download_diarization_models(cache_dir: Path) -> tuple[str, str]:
 
 
 def main() -> None:
+    from .pipeline import _diarization_backend, _load_pyannote, _pyannote_device
+
     cache_dir = model_cache_dir()
     print("Загрузка моделей диаризации…", flush=True)
-    download_diarization_models(cache_dir)
+    if _diarization_backend() == "sherpa":
+        download_diarization_models(cache_dir)
+    else:
+        _load_pyannote(cache_dir, _pyannote_device())
 
     model_name = whisper_model_name()
     print(f"Подготовка Whisper ({model_name})…", flush=True)
